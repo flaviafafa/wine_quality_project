@@ -1,0 +1,455 @@
+---
+title: "Classifying wine quality from physicochemical properties"
+author: "Flavia Jiang, Chunyu Wu"
+date: "2023-12-01"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = TRUE)
+options(scipen = 1, digits = 4)
+library(dplyr)
+library(e1071)
+library(tidyverse)
+library(splitTools)
+library(caret)
+library(sets)
+library(leaps)
+library(MASS)
+library(glmnet)
+library(pls)
+library(pROC)
+library(tree)
+library(randomForest)
+library(gbm)
+library(class)
+```
+
+# Cleaning
+Created red_df for red wine and white_df for white wine.
+```{r}
+df <- read.csv("wine-quality-white-and-red.csv")
+red_df <- subset(filter(df, type == "red"), select = -type)
+white_df <- subset(filter(df, type == "white"), select = -type)
+```
+
+# Predict red wine quality 
+## Descriptive Statistics
+```{r}
+summary(red_df)
+```
+```{r}
+hist(red_df$quality, breaks = seq(-0.5, 10.5))
+table(red_df$quality)
+```
+The distribution of response classes is unbalanced.
+
+```{r}
+cor <- round(cor(red_df),3)
+(cor != 1 & (cor > 0.7 | cor < -0.7))
+```
+Pair of variables highly correlated (magnitude > 0.7): none
+
+# Modeling
+It is possible to do repeated k-fold CV with the trainControl function from the caret package. However, it only outputs RMSE, R-sq, and MAE for regression methods. We thought it would be more helpful to know the accuracy and AUC, so we did this manually for every method. 
+
+## MLR
+```{r}
+mlr_cv <- function(df){
+  accuracy_mlr <- c()
+  mae_mlr <- c()
+  auc_mlr <- c()
+  # for each seed, do a 5-fold CV
+  for (seed in c(1, 10, 100, 1000, 10000)){
+    set.seed(seed)
+    folds <- createFolds(df$quality,k=5)
+    # for each fold:
+    for (i in 1:5){
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],] 
+      model <- lm(quality~., data = train)
+      pred <- predict(model, test)
+      mae_mlr <- c(mae_mlr, mean(abs(test$quality-pred)))
+      # round pred to the nearest integer to calculate accuracy and AUC
+      accuracy_mlr <- c(accuracy_mlr, mean(round(pred) == test$quality))
+      auc_mlr <- c(auc_mlr, multiclass.roc(test$quality, round(pred))$auc)
+   }
+  }
+  return(c(mean(accuracy_mlr), mean(auc_mlr), mean(mae_mlr)))
+}
+
+mlr_cv(red_df)
+```
+CV accuracy = 59.23%
+CV AUC = 77.28%
+CV MAE = 0.504
+
+
+### Best subset selection
+For computational efficiency, we would first let the regsubsets function choose the best k-variable model (k ranges from 0 to 11). Then for each k-variable model, we did a repeated 5-fold CV.
+```{r}
+best_cv <- function(df){
+  p <- ncol(df) - 1
+  best_subset <- regsubsets(quality~., data=df, nvmax = p)
+  which <- summary(best_subset)$which
+  for (i in 1:p){
+    columns <- c(which[i, -1], T)
+    temp <- df[,columns]
+    print(c(i,mlr_cv(temp)))
+  }
+}
+best_cv(red_df)
+```
+The 7-predictor model resulted in the highest accuracy - 59.29%.
+```{r}
+summary(regsubsets(quality~., data=red_df, nvmax = 11))$which[7,]
+```
+
+## LDA
+
+```{r}
+lda_cv <- function(df){
+  accuracy_lda <- c()
+  mae_lda <- c()
+  auc_lda <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)){
+    set.seed(seed)
+    folds <- createFolds(df$quality,k=5)
+    for (i in 1:5){
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],] 
+      model <- lda(quality ~ ., data = train)
+      pred <- as.numeric(as.character(predict(model, test)$class))
+      accuracy_lda <- c(accuracy_lda, mean(pred == test$quality))
+      mae_lda <- c(mae_lda, mean(abs(test$quality - pred)))
+      auc_lda <- c(auc_lda, multiclass.roc(test$quality, pred)$auc)
+  }
+}
+  print(c(mean(accuracy_lda),mean(auc_lda), mean(mae_lda)))
+}
+lda_cv(red_df)
+```
+
+## Naive Bayes
+
+Assumes predictors are independent of each other.
+```{r}
+nb_cv <- function(df){
+  accuracy_nb <- c()
+  mae_nb <- c()
+  auc_nb <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)){
+    set.seed(seed)
+    folds <- createFolds(df$quality,k=5)
+    for (i in 1:5){
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],] 
+      model <- naiveBayes(quality~., data = train)
+      pred <- as.numeric(as.character(predict(model, test)))
+      accuracy_nb <- c(accuracy_nb, mean(pred == test$quality))
+      mae_nb <- c(mae_nb, mean(abs(test$quality - pred)))
+      auc_nb <- c(auc_nb, multiclass.roc(test$quality, pred)$auc)
+  }
+}
+  print(c(mean(accuracy_nb), mean(auc_nb), mean(mae_nb)))
+}
+nb_cv(red_df)
+```
+
+## Lasso regression
+```{r}
+lasso_ridge_cv <- function(df, type){
+  grid <- 10^seq(10, -4, length = 1000)
+  accuracy <- c()
+  mae <- c()
+  auc <- c()
+  lambdas <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)){
+    set.seed(seed)
+    folds <- createFolds(df$quality,k=5)
+    for (i in 1:5){
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],] 
+      train_X <- data.matrix(subset(train, select = -c(quality)))
+      train_Y <- data.matrix(train$quality)
+      test_X <- data.matrix(subset(test, select = -c(quality)))
+      test_Y <- data.matrix(test$quality)
+      cv <- cv.glmnet(train_X, train_Y, alpha = type, lambda = grid, type.measure="mae")
+      bestlam <- cv$lambda.min
+      lambdas <- c(lambdas, bestlam)
+      model <- glmnet(train_X, train_Y, alpha = type, lambda = bestlam)
+      pred <- predict(model, s=bestlam, newx = test_X)
+      pred <- as.vector(pred)
+      accuracy <- c(accuracy, mean(round(pred) == test$quality))
+      mae <- c(mae, mean(abs(test$quality-pred)))
+      auc <- c(auc, multiclass.roc(test$quality, round(pred))$auc)
+  }
+}
+  print(c(mean(accuracy), mean(auc), mean(mae)))
+  print(lambdas)
+}
+lasso_ridge_cv(red_df, 1)
+```
+
+It is basically a MLR because the lambdas chosen by CV were very small.
+
+## Ridge regression
+```{r}
+lasso_ridge_cv(red_df, 0)
+```
+
+## PCR
+```{r}
+pcr_cv <- function(df){
+  accuracy_pcr <- c()
+  mae_pcr <- c()
+  auc_pcr <- c()
+  n_comp <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)){
+    set.seed(seed)
+    folds <- createFolds(df$quality,k=5)
+    for (i in 1:5){
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],] 
+      model <- pcr(quality~., data = train, scale = T, validation = "CV")
+      cv_mse <- MSEP(model) # select number of components based on MSEP
+      best_ncomp <- which.min(cv_mse$val[1, , ]) -1
+      n_comp <- c(n_comp, best_ncomp)
+      # validationplot(model, val.type = "MSEP")
+      pred <- predict(model, subset(test, select = -quality), ncomp = best_ncomp)
+      accuracy_pcr <- c(accuracy_pcr, mean(round(pred) == test$quality))
+      mae_pcr <- c(mae_pcr, mean(abs(test$quality-pred)))
+      auc_pcr <- c(auc_pcr, multiclass.roc(test$quality, round(pred))$auc)
+  }
+}
+  print(c(mean(accuracy_pcr), mean(auc_pcr), mean(mae_pcr)))
+  print(n_comp)
+}
+pcr_cv(red_df)
+```
+
+## Classification tree
+```{r}
+trees_cv <- function(df) {
+  accuracy_trees <- c()
+  mae_trees <- c()
+  auc_trees <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)) {
+    set.seed(seed)
+    folds <- createFolds(df$quality, k=5)
+    for (i in 1:5) {
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],]
+      train$quality <- factor(train$quality)
+      model <- tree(quality~., train)
+      pred <- as.numeric(as.character(predict(model, test, type="class")))
+      accuracy_trees <- c(accuracy_trees, mean(pred == test$quality))
+      mae_trees <- c(mae_trees, mean(abs(test$quality - pred)))
+      auc_trees <- c(auc_trees, multiclass.roc(test$quality, pred)$auc)
+    }
+  }
+  return(c(mean(accuracy_trees), mean(auc_trees), mean(mae_trees)))
+}
+trees_cv(red_df)
+```
+
+## Random Forest
+```{r}
+rf_cv <- function(df) {
+  accuracy_rf <- c()
+  mae_rf <- c()
+  auc_rf <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)) {
+    set.seed(seed)
+    folds <- createFolds(df$quality, k=5)
+    for (i in 1:5) {
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],]
+      train$quality <- factor(train$quality)
+      model <- randomForest(quality~., train, mtry = 3, importance=TRUE)
+      pred <- as.numeric(as.character(predict(model, test)))
+      accuracy_rf <- c(accuracy_rf, mean(pred == test$quality))
+      mae_rf <- c(mae_rf, mean(abs(test$quality - pred)))
+      auc_rf <- c(auc_rf, multiclass.roc(test$quality, pred)$auc)
+    }
+  }
+  return(c(mean(accuracy_rf), mean(auc_rf), mean(mae_rf)))
+}
+rf_cv(red_df)
+```
+```{r}
+rf_cv <- function(df) {
+  accuracy_rf <- c()
+  mae_rf <- c()
+  auc_rf <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)) {
+    set.seed(seed)
+    folds <- createFolds(df$quality, k=5)
+    for (i in 1:5) {
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],]
+      train$quality <- factor(train$quality)
+      model <- randomForest(quality~., train, mtry = 4, importance=TRUE)
+      pred <- as.numeric(as.character(predict(model, test)))
+      accuracy_rf <- c(accuracy_rf, mean(pred == test$quality))
+      mae_rf <- c(mae_rf, mean(abs(test$quality - pred)))
+      auc_rf <- c(auc_rf, multiclass.roc(test$quality, pred)$auc)
+    }
+  }
+  return(c(mean(accuracy_rf), mean(auc_rf), mean(mae_rf)))
+}
+rf_cv(red_df)
+```
+
+
+
+## Bagging
+```{r}
+bag_cv <- function(df) {
+  accuracy_bag <- c()
+  mae_bag <- c()
+  auc_bag <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)) {
+    set.seed(seed)
+    folds <- createFolds(df$quality, k=5)
+    for (i in 1:5) {
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],]
+      train$quality <- factor(train$quality)
+      model <- randomForest(quality~., train, mtry=11, importance=T)
+      pred <- as.numeric(as.character(predict(model, test)))
+      accuracy_bag <- c(accuracy_bag, mean(pred == test$quality))
+      mae_bag <- c(mae_bag, mean(abs(test$quality - pred)))
+      auc_bag <- c(auc_bag, multiclass.roc(test$quality, pred)$auc)
+    }
+  }
+
+  return(c(mean(accuracy_bag), mean(auc_bag), mean(mae_bag)))
+}
+bag_cv(red_df)
+```
+
+## Boosting (regression)
+```{r}
+boost_cv <- function(df) {
+  accuracy_boost <- c()
+  mae_boost <- c()
+  auc_boost <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)) {
+    set.seed(seed)
+    folds <- createFolds(df$quality, k=5)
+    for (i in 1:5) {
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],]
+      model <- gbm(quality~., train,distribution = "gaussian", n.trees = 5000, 
+                   interaction.depth = 4, shrinkage = 0.05)
+      pred <- predict(model, test)
+      accuracy_boost <- c(accuracy_boost, mean(round(pred) == test$quality))
+      mae_boost <- c(mae_boost, mean(abs(test$quality - pred)))
+      auc_boost <- c(auc_boost, multiclass.roc(test$quality, round(pred))$auc)
+    }
+  }
+  return(c(mean(accuracy_boost), mean(auc_boost), mean(mae_boost)))
+}
+boost_cv(red_df)
+```
+
+## knn
+```{r}
+knn_cv <- function(df) {
+  accuracy_knn <- c()
+  mae_knn <- c()
+  auc_knn <- c()
+  for (seed in c(1, 10, 100, 1000, 10000)) {
+    set.seed(seed)
+    folds <- createFolds(df$quality, k=5)
+    for (i in 1:5) {
+      train <- df[-folds[[i]],] 
+      test <- df[folds[[i]],]
+      pred <- knn(train, test, train$quality, k = 1)
+      pred <- as.numeric(as.character(pred))
+      accuracy_knn <- c(accuracy_knn, mean(round(pred) == test$quality))
+      mae_knn <- c(mae_knn, mean(abs(as.numeric(test$quality) - pred)))
+      auc_knn <- c(auc_knn, multiclass.roc(test$quality, round(pred))$auc)
+    }
+  }
+  return(c(mean(accuracy_knn), mean(auc_knn), mean(mae_knn)))
+}
+knn_cv(red_df)
+```
+
+# Predict white wine quality
+```{r}
+summary(white_df)
+hist(white_df$quality, breaks = seq(-0.5, 10.5))
+table(white_df$quality)
+```
+
+## MLR
+```{r}
+mlr_cv(white_df)
+```
+
+### Best subset
+```{r}
+best_cv(white_df)
+```
+```{r}
+summary(regsubsets(quality~., data=white_df, nvmax = 11))$which[9,]
+```
+
+## LDA
+```{r}
+lda_cv(white_df)
+```
+
+## QDA
+Error
+
+## Naive Bayes
+```{r}
+nb_cv(white_df)
+```
+
+## Lasso
+```{r}
+lasso_ridge_cv(white_df, 1)
+```
+
+## Ridge
+```{r}
+lasso_ridge_cv(white_df, 0)
+```
+
+## PCR
+```{r}
+pcr_cv(white_df)
+```
+
+## Classification tree
+```{r}
+trees_cv(white_df)
+```
+
+## Random Forest
+```{r}
+rf_cv(white_df)
+```
+
+## Bagging
+```{r}
+bag_cv(white_df)
+```
+
+## Boosting
+```{r}
+boost_cv(white_df)
+```
+
+## knn
+```{r}
+knn_cv(white_df)
+```
+
+# Reference
+James, Gareth, et al.*An Introduction to Statistical Learning with Applications in R*. 2nd Edition, 2023.
